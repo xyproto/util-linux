@@ -774,25 +774,91 @@ failed:
 	return 0;
 }
 
+#ifdef CDROMREADTOCHDR
+static int cdrom_get_ntracks(int fd)
+{
+	struct cdrom_tochdr header;
+
+	if (ioctl(fd, CDROMREADTOCHDR, &header) == 0)
+		return header.cdth_trk1 - header.cdth_trk0 + 1;
+
+	return -EINVAL;
+}
+#endif
+
+#ifdef CDROMREADTOCENTRY
+static int cdrom_get_datatrack_offset(int fd, int track, uint64_t *offset)
+{
+	struct cdrom_tocentry entry;
+	int rc;
+
+	entry.cdte_track = track;
+	entry.cdte_format = CDROM_LBA;
+
+	rc = ioctl(fd, CDROMREADTOCENTRY, &entry);
+	if (rc < 0)
+		return rc;
+	if (!(entry.cdte_ctrl & CDROM_DATA_TRACK))
+		return 1;
+
+	*offset = (uintmax_t) entry.cdte_addr.lba * 2048;
+	DBG(LOWPROBE, ul_debug("CDROM: data track #%d LBA: %ju", track, (uintmax_t) *offset));
+	return 0;
+}
+#endif
+
 /*
+ * If no offset for probing area is specified then we try to look for data track
+ * on medium and check offset to the first data track. This all make sense for
+ * hybrid media with data+audio, the usual data-only media contains just one
+ * track. Note that for example udev calls blkid with offset (based on
+ * cdrom_id), in this case we follow the offset.
+ *
  * Linux kernel reports (BLKGETSIZE) cdrom device size greater than area
  * readable by read(2). We have to reduce the probing area to avoid unwanted
  * I/O errors in probing functions. It seems that unreadable are always last 2
  * or 3 CD blocks (CD block size is 2048 bytes, it means 12 in 512-byte
  * sectors).
+ *
+ * Note that size modification is only optimization for usual use-case. The I/O
+ * errors on CDROMs are non-fatal, because get proper size of the medium/track
+ * seems too tricky.
  */
 static void cdrom_size_correction(blkid_probe pr)
 {
 	uint64_t n, nsectors = pr->size >> 9;
 
+#ifdef defined(CDROMREADTOCENTRY) && defined(CDROMREADTOCHDR)
+	if (pr->off == 0) {
+		uint64_t off;
+		int rc, i, ntracks = cdrom_get_ntracks(pr->fd);
+
+		DBG(LOWPROBE, ul_debug("CDROM: number of tracks: %d", ntracks));
+
+		/* We don't care about CDROMs with only one track */
+		for (i = 1; ntracks > 1 && i <= ntracks; i++) {
+			rc = cdrom_get_datatrack_offset(pr->fd, i, &off);
+			if (rc == 1)
+				continue;	/* no data track */
+			if (rc < 0 || off == 0)
+				break;		/* error or offset is zero */
+
+			DBG(LOWPROBE, ul_debug("CDROM: change offset from %ju to %ju", pr->off, off));
+			pr->off = off;
+			DBG(LOWPROBE, ul_debug("CDROM: change size from %ju to %ju", pr->size, pr->size - off));
+			pr->size -= off;
+			break;
+		}
+	}
+#endif
 	for (n = nsectors - 12; n < nsectors; n++) {
 		if (!is_sector_readable(pr->fd, n))
-			goto failed;
+			goto reduce;
 	}
 
 	DBG(LOWPROBE, ul_debug("CDROM: full size available"));
 	return;
-failed:
+reduce:
 	/* 'n' is the failed sector, reduce device size to n-1; */
 	DBG(LOWPROBE, ul_debug("CDROM: reduce size from %ju to %ju.",
 				(uintmax_t) pr->size,
@@ -880,8 +946,7 @@ int blkid_probe_set_device(blkid_probe pr, int fd,
 		goto err;
 	}
 
-	if (pr->size <= 1440 * 1024 && !S_ISCHR(sb.st_mode))
-		pr->flags |= BLKID_FL_TINY_DEV;
+	DBG(LOWPROBE, ul_debug("default probing area: offset=%ju, size=%ju", pr->off, pr->size));
 
 	if (S_ISBLK(sb.st_mode) && sysfs_devno_is_lvm_private(sb.st_rdev)) {
 		DBG(LOWPROBE, ul_debug("ignore private LVM device"));
@@ -898,6 +963,8 @@ int blkid_probe_set_device(blkid_probe pr, int fd,
 		cdrom_size_correction(pr);
 	}
 #endif
+	if (pr->size <= 1440 * 1024 && !S_ISCHR(sb.st_mode))
+		pr->flags |= BLKID_FL_TINY_DEV;
 
 	DBG(LOWPROBE, ul_debug("ready for low-probing, offset=%"PRIu64", size=%"PRIu64"",
 				pr->off, pr->size));
